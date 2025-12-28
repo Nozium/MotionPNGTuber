@@ -13,6 +13,7 @@
 - 🖼️ **高精度口消し**: 元動画から口を自然に消去し、口スプライトを合成
 - 🎯 **簡単キャリブレーション**: マウス操作で口の位置・サイズ・回転を調整
 - 🖥️ **GUIツール**: ワンクリックで解析から実行まで
+- ⚡ **軽量モード対応**: YOLOv9-Wholebody25による軽量検出（ONNX Runtime、CPU動作可）
 
 ## 🎯 こんな人におすすめ
 
@@ -34,6 +35,21 @@
 - **Visual C++ Build Tools**: [ダウンロード](https://visualstudio.microsoft.com/visual-cpp-build-tools/)（「C++ によるデスクトップ開発」を選択）
 
 ### 1. インストール（初回のみ）
+
+#### 🚀 軽量版（推奨・簡単）
+
+```bash
+# 仮想環境を作成・有効化
+python -m venv .venv
+.venv\Scripts\activate
+
+# 依存パッケージをインストール
+pip install onnxruntime opencv-python numpy Pillow sounddevice scipy
+```
+
+> 💡 軽量版は `--detector yolov9` を使用し、mmcv/mmdet/mmpose のインストールが不要です。
+
+#### 📦 フル版（anime-face-detector使用）
 
 ```bash
 # 仮想環境を作成・有効化
@@ -115,6 +131,19 @@ python mouth_track_gui.py
 
 - **GPU（CUDA）使用時**: 顔トラッキングが高速（約30FPS）
 - **CPUのみ**: トラッキングは低速（約2-5FPS）だが動作可能。リアルタイム再生自体はCPUで十分
+
+### 検出器の比較
+
+| 項目 | YOLOv9（軽量版） | anime-face-detector（フル版） |
+|------|------------------|------------------------------|
+| **依存パッケージ** | `onnxruntime` のみ (~50MB) | `mmcv-full`, `mmdet`, `mmpose` (~1GB+) |
+| **インストール難易度** | 簡単 | やや難しい（mmcv-fullのビルドが必要） |
+| **CPU動作** | ✅ 高速 | ⚠️ 低速 |
+| **GPU動作** | ✅ 対応 | ✅ 対応（CUDA必須） |
+| **検出方式** | 顔/口BBox + 頭部方向 | 28点ランドマーク |
+| **コマンドオプション** | `--detector yolov9` | `--detector anime` |
+
+> 💡 **推奨**: まずは軽量版（YOLOv9）をお試しください。インストールが簡単で、CPUでも十分な速度で動作します。
 
 ---
 
@@ -217,7 +246,8 @@ MotionPNGTuber/
 ├── mouth_track_gui.py              # メインGUI
 ├── mouth_erase_tuner_gui.py        # 口消しチューナーGUI（おまけツール）
 ├── loop_lipsync_runtime_patched_emotion_auto.py  # リアルタイム実行（感情対応）
-├── face_track_anime_detector.py    # 顔トラッキング
+├── face_track_anime_detector.py    # 顔トラッキング（anime/yolov9切替対応）
+├── yolov9_wholebody_detector.py    # YOLOv9軽量検出器
 ├── calibrate_mouth_track.py        # キャリブレーション
 ├── erase_mouth_offline.py          # 口消し処理
 ├── auto_mouth_track_v2.py          # 自動トラッキング
@@ -225,6 +255,8 @@ MotionPNGTuber/
 ├── preview_mouth_track.py          # トラッキングプレビュー
 ├── realtime_emotion_audio.py       # 感情解析
 ├── requirements.txt
+├── models/                         # ONNXモデル（自動ダウンロード）
+│   └── yolov9_wholebody25/
 ├── assets/                         # 動画アセット（サンプル）
 │   ├── assets01/
 │   │   ├── loop.mp4
@@ -370,10 +402,24 @@ python mouth_erase_tuner_gui.py
 
 ### 1. 顔トラッキング
 
+#### 軽量版（YOLOv9・推奨）
+
 ```bash
 python face_track_anime_detector.py \
     --video assets/assets01/loop.mp4 \
     --out assets/assets01/mouth_track.npz \
+    --detector yolov9 \
+    --device cpu \
+    --pad 2.1
+```
+
+#### フル版（anime-face-detector）
+
+```bash
+python face_track_anime_detector.py \
+    --video assets/assets01/loop.mp4 \
+    --out assets/assets01/mouth_track.npz \
+    --detector anime \
     --device auto \
     --pad 2.1
 ```
@@ -426,7 +472,22 @@ python loop_lipsync_runtime_patched_emotion_auto.py \
 
 ## ❓ トラブルシューティング
 
-### mmcv-full のインストールが失敗する
+### YOLOv9モデルが見つからない（軽量版）
+
+初回実行時にモデルが自動ダウンロードされます。ネットワーク環境によっては手動ダウンロードが必要な場合があります：
+
+```bash
+# ダウンロード手順を表示
+python yolov9_wholebody_detector.py --download
+```
+
+または以下から手動ダウンロード：
+1. https://s3.ap-northeast-2.wasabisys.com/pinto-model-zoo/459_YOLOv9-Wholebody25/resources_n.tar.gz
+2. 展開して `models/yolov9_wholebody25/` に配置
+
+### mmcv-full のインストールが失敗する（フル版）
+
+> 💡 **ヒント**: mmcv-fullのインストールが難しい場合は、軽量版（YOLOv9）の使用を推奨します。
 
 1. Visual C++ Build Tools がインストールされているか確認
 2. Python のバージョンが 3.10 か確認
@@ -436,7 +497,7 @@ python loop_lipsync_runtime_patched_emotion_auto.py \
    mim install mmcv-full==1.7.0
    ```
 
-### anime-face-detector が動かない
+### anime-face-detector が動かない（フル版）
 
 ```bash
 pip uninstall anime-face-detector
@@ -506,3 +567,4 @@ MIT License
 - [anime-face-detector](https://github.com/hysts/anime-face-detector)
 - [MMDetection](https://github.com/open-mmlab/mmdetection)
 - [MMPose](https://github.com/open-mmlab/mmpose)
+- [PINTO_model_zoo](https://github.com/PINTO0309/PINTO_model_zoo) - YOLOv9-Wholebody25 モデル
