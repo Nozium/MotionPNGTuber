@@ -3,24 +3,30 @@
 """
 face_track_anime_detector.py
 
-anime-face-detector を使用してアニメ顔の口領域を直接検出するトラッカー。
-ORBベースの手法と異なり、フレームごとに独立して検出するため
-高速な動きに強い。
+アニメ顔の口領域を検出するトラッカー。
+2つの検出バックエンドをサポート:
+  - anime: anime-face-detector (mmdet/mmpose依存、高精度)
+  - yolov9: YOLOv9-Wholebody25 (ONNX Runtime、軽量・高速)
 
 インストール:
+    # anime-face-detector を使う場合
     pip install openmim
-    mim install mmcv-full
-    mim install mmdet
-    mim install mmpose
+    mim install mmcv-full mmdet mmpose
     pip install anime-face-detector
 
+    # YOLOv9 を使う場合 (軽量)
+    pip install onnxruntime
+
 使い方:
+    # anime-face-detector (従来)
     python face_track_anime_detector.py \
-        --video "loop.mp4" \
-        --out "mouth_track.npz" \
-        --debug "mouth_track_debug.mp4" \
-        --pad 1.5 \
-        --smooth-cutoff 3.0
+        --video "loop.mp4" --out "mouth_track.npz" \
+        --detector anime
+
+    # YOLOv9-Wholebody25 (軽量・推奨)
+    python face_track_anime_detector.py \
+        --video "loop.mp4" --out "mouth_track.npz" \
+        --detector yolov9
 
 出力:
     mouth_track.npz (loop_lipsync_runtime.py と互換)
@@ -37,20 +43,58 @@ import json
 import shutil
 import sys
 import time
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Any, List, Dict
 
 import cv2
 import numpy as np
 
-# anime-face-detector
-try:
-    from anime_face_detector import create_detector
-    HAS_ANIME_DETECTOR = True
-except ImportError:
-    HAS_ANIME_DETECTOR = False
-    print("[warn] anime-face-detector not installed. Run:")
-    print("  pip install openmim && mim install mmcv-full mmdet mmpose")
-    print("  pip install anime-face-detector")
+# 遅延読み込み用のグローバル変数
+_anime_detector_module = None
+_yolov9_detector_module = None
+
+
+def _load_anime_detector():
+    """anime-face-detector を遅延読み込み"""
+    global _anime_detector_module
+    if _anime_detector_module is not None:
+        return _anime_detector_module
+
+    try:
+        from anime_face_detector import create_detector
+        _anime_detector_module = {"create_detector": create_detector, "available": True}
+    except ImportError:
+        _anime_detector_module = {"available": False}
+        print("[warn] anime-face-detector not installed. Run:")
+        print("  pip install openmim && mim install mmcv-full mmdet mmpose")
+        print("  pip install anime-face-detector")
+
+    return _anime_detector_module
+
+
+def _load_yolov9_detector():
+    """YOLOv9-Wholebody25 を遅延読み込み"""
+    global _yolov9_detector_module
+    if _yolov9_detector_module is not None:
+        return _yolov9_detector_module
+
+    try:
+        from yolov9_wholebody_detector import (
+            YOLOv9WholebodyDetector,
+            mouth_bbox_to_quad,
+            print_download_instructions,
+        )
+        _yolov9_detector_module = {
+            "YOLOv9WholebodyDetector": YOLOv9WholebodyDetector,
+            "mouth_bbox_to_quad": mouth_bbox_to_quad,
+            "print_download_instructions": print_download_instructions,
+            "available": True,
+        }
+    except ImportError as e:
+        _yolov9_detector_module = {"available": False, "error": str(e)}
+        print(f"[warn] yolov9_wholebody_detector not available: {e}")
+        print("  pip install onnxruntime")
+
+    return _yolov9_detector_module
 
 
 # ランドマークのインデックス定義
@@ -707,17 +751,106 @@ def save_metrics_png(path: str, series: dict[str, np.ndarray], title: str = "") 
 
 
 
-def main() -> int:
-    if not HAS_ANIME_DETECTOR:
-        print("[error] anime-face-detector is required.")
-        return 1
+def create_detector_wrapper(detector_type: str, device: str, model: str = "yolov3") -> Tuple[Any, str]:
+    """
+    検出器を作成するラッパー関数。
 
+    Args:
+        detector_type: "anime" or "yolov9"
+        device: "cpu", "cuda:0", "auto" など
+        model: anime-face-detector用のモデル名
+
+    Returns:
+        (detector, actual_device)
+    """
+    if detector_type == "yolov9":
+        module = _load_yolov9_detector()
+        if not module.get("available"):
+            raise RuntimeError(
+                "YOLOv9 detector not available. "
+                "Install: pip install onnxruntime"
+            )
+
+        YOLOv9WholebodyDetector = module["YOLOv9WholebodyDetector"]
+
+        # device fallback
+        if device == "auto":
+            device_try = ["cuda", "cpu"]
+        else:
+            device_try = [device]
+            if device.startswith("cuda"):
+                device_try.append("cpu")
+
+        detector = None
+        last_err = None
+        actual_device = device
+
+        for dev in device_try:
+            try:
+                detector = YOLOv9WholebodyDetector(device=dev)
+                actual_device = dev
+                if dev != device:
+                    print(f"[info] detector fallback: using device={dev}")
+                break
+            except Exception as e:
+                last_err = e
+                print(f"[warn] YOLOv9 detector init failed on {dev}: {e}")
+
+        if detector is None:
+            # モデルが見つからない場合はダウンロード手順を表示
+            module["print_download_instructions"]()
+            raise RuntimeError(f"Failed to create YOLOv9 detector. Last error: {last_err}")
+
+        return detector, actual_device
+
+    else:  # anime
+        module = _load_anime_detector()
+        if not module.get("available"):
+            raise RuntimeError(
+                "anime-face-detector not available. "
+                "Install: pip install openmim && mim install mmcv-full mmdet mmpose && pip install anime-face-detector"
+            )
+
+        create_detector = module["create_detector"]
+
+        # device fallback
+        if device == "auto":
+            device_try = ["cuda:0", "cpu"]
+        else:
+            device_try = [device]
+            if device.startswith("cuda"):
+                device_try.append("cpu")
+
+        detector = None
+        last_err = None
+        actual_device = device
+
+        for dev in device_try:
+            try:
+                detector = create_detector(model, device=dev)
+                actual_device = dev
+                if dev != device:
+                    print(f"[info] detector fallback: using device={dev}")
+                break
+            except Exception as e:
+                last_err = e
+                print(f"[warn] anime detector init failed on {dev}: {e}")
+
+        if detector is None:
+            raise RuntimeError(f"Failed to create anime detector. Last error: {last_err}")
+
+        return detector, actual_device
+
+
+def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--video", required=True, help="入力動画")
     ap.add_argument("--out", required=True, help="出力 mouth_track.npz")
     ap.add_argument("--debug", default="", help="デバッグ動画出力 (optional)")
-    ap.add_argument("--model", default="yolov3", choices=["yolov3"], help="検出モデル")
-    ap.add_argument("--device", default="cuda:0", help="cpu / cuda:N / auto (try cuda then cpu)")
+    ap.add_argument("--detector", default="yolov9", choices=["anime", "yolov9"],
+                    help="検出バックエンド: anime=anime-face-detector / yolov9=YOLOv9-Wholebody25(軽量)")
+    ap.add_argument("--model", default="yolov3", choices=["yolov3"], help="anime-face-detector用モデル")
+    ap.add_argument("--device", default="cpu", help="cpu / cuda:N / auto (try cuda then cpu)")
     ap.add_argument("--quality", default="custom", choices=["max", "high", "normal", "fast", "custom"], help="解析品質プリセット (customでdet-scale/strideを使用)")
     ap.add_argument("--det-scale", type=float, default=1.0, help="解析時の入力縮小倍率 (1.0=元のまま)")
     ap.add_argument("--stride", type=int, default=1, help="解析を何フレーム毎に実行するか (1=全フレーム)")
@@ -738,29 +871,19 @@ def main() -> int:
     ap.add_argument("--ref-sprite-h", type=int, default=85, help="参照スプライト高さ (互換性用)")
     args = ap.parse_args()
 
-    print(f"[info] creating detector (model={args.model}, device={args.device})...")
-    # device fallback:
-    # - --device auto: try cuda:0 then cpu
-    # - --device cuda:*: if init fails, fallback cpu
-    detector = None
-    last_err = None
-    if args.device == "auto":
-        device_try = ["cuda:0", "cpu"]
-    else:
-        device_try = [args.device]
-        if args.device.startswith("cuda"):
-            device_try.append("cpu")
-    for dev in device_try:
-        try:
-            detector = create_detector(args.model, device=dev)
-            if dev != args.device:
-                print(f"[info] detector fallback: using device={dev}")
-            break
-        except Exception as e:
-            last_err = e
-            print(f"[warn] detector init failed on {dev}: {e}")
-    if detector is None:
-        raise RuntimeError(f"Failed to create detector. Last error: {last_err}")
+    print(f"[info] creating detector (type={args.detector}, device={args.device})...")
+    try:
+        detector, actual_device = create_detector_wrapper(args.detector, args.device, args.model)
+        print(f"[info] detector ready on {actual_device}")
+    except RuntimeError as e:
+        print(f"[error] {e}")
+        return 1
+
+    # YOLOv9用のヘルパー関数を取得
+    yolov9_mouth_bbox_to_quad = None
+    if args.detector == "yolov9":
+        module = _load_yolov9_detector()
+        yolov9_mouth_bbox_to_quad = module.get("mouth_bbox_to_quad")
     cap = cv2.VideoCapture(args.video)
     if not cap.isOpened():
         print(f"[error] failed to open video: {args.video}")
@@ -838,59 +961,131 @@ def main() -> int:
         if not ok:
             break
 
-        # anime-face-detector で検出 (stride対応)
-        # 戻り値: [{'bbox': [x1,y1,x2,y2,conf], 'keypoints': (28,3)}, ...]
         do_detect = (i % stride == 0)
         preds = []
+        quad = None
+        conf = 0.0
+
         if do_detect:
             det_count += 1
             det_frame = frame
             if det_scale != 1.0:
                 det_frame = cv2.resize(frame, (det_w, det_h), interpolation=det_interp)
 
-            preds = detector(det_frame)
+            # 検出器タイプに応じて処理を分岐
+            if args.detector == "yolov9":
+                # YOLOv9-Wholebody25
+                # 戻り値: [{'face_bbox': [...], 'mouth_bbox': [...], 'head_angle': float}, ...]
+                raw_results = detector(det_frame)
 
-            if det_scale != 1.0 and len(preds) > 0:
-                scaled_preds = []
-                for pred in preds:
-                    bbox = np.asarray(pred['bbox'], dtype=np.float32).copy()
-                    if bbox.shape[0] >= 4:
-                        bbox[:4] *= det_inv
-                    keypoints = np.asarray(pred['keypoints'], dtype=np.float32).copy()
-                    if keypoints.shape[1] >= 2:
-                        keypoints[:, :2] *= det_inv
-                    scaled_preds.append({'bbox': bbox, 'keypoints': keypoints})
-                preds = scaled_preds
+                for res in raw_results:
+                    face_bbox = res.get('face_bbox')
+                    mouth_bbox = res.get('mouth_bbox')
 
-        quad = None
-        conf = 0.0
+                    if face_bbox is not None:
+                        # スケール補正
+                        if det_scale != 1.0:
+                            face_bbox = face_bbox.copy()
+                            face_bbox[:4] *= det_inv
+                            if mouth_bbox is not None:
+                                mouth_bbox = mouth_bbox.copy()
+                                mouth_bbox[:4] *= det_inv
 
-        if len(preds) > 0:
-            # 最も大きい(面積が大きい)顔を選択
-            best_pred = max(preds, key=lambda p: (p['bbox'][2] - p['bbox'][0]) * (p['bbox'][3] - p['bbox'][1]))
-            bbox = best_pred['bbox']
-            keypoints = best_pred['keypoints']
+                        preds.append({
+                            'face_bbox': face_bbox,
+                            'mouth_bbox': mouth_bbox,
+                            'head_angle': res.get('head_angle', 0.0),
+                            'head_direction': res.get('head_direction'),
+                        })
 
-            # 顔検出の信頼度チェック
-            if bbox[4] >= args.min_conf:
-                if args.quad_mode == "bbox":
-                    quad, conf = mouth_quad_from_face_bbox_and_landmarks(
-                        bbox, keypoints,
-                        sprite_aspect=args.sprite_aspect,
-                        pad=args.pad
-                    )
-                elif args.quad_mode == "mouth":
-                    quad, conf = mouth_quad_from_landmarks(
-                        keypoints, bbox=None, sprite_aspect=args.sprite_aspect, pad=args.pad
-                    )
-                else:
-                    # hybrid: 口点ベース + 最低サイズfloor
-                    quad, conf = mouth_quad_from_landmarks(
-                        keypoints, bbox=bbox,
-                        sprite_aspect=args.sprite_aspect, pad=args.pad,
-                        min_mouth_w_ratio=args.min_mouth_w_ratio,
-                        min_mouth_w_px=args.min_mouth_w_px
-                    )
+                # 最大の顔を選択してquad生成
+                if len(preds) > 0:
+                    best_pred = max(preds, key=lambda p: (
+                        (p['face_bbox'][2] - p['face_bbox'][0]) *
+                        (p['face_bbox'][3] - p['face_bbox'][1])
+                    ))
+                    face_bbox = best_pred['face_bbox']
+                    mouth_bbox = best_pred['mouth_bbox']
+                    head_angle = best_pred['head_angle']
+
+                    if face_bbox[4] >= args.min_conf:
+                        if mouth_bbox is not None:
+                            # 口BBoxからquadを生成
+                            quad = yolov9_mouth_bbox_to_quad(
+                                mouth_bbox,
+                                head_angle=head_angle,
+                                pad=args.pad,
+                                sprite_aspect=args.sprite_aspect,
+                            )
+                            conf = float(mouth_bbox[4])
+                        else:
+                            # 口が検出されなかった場合は顔BBoxから推定
+                            # 顔の下半分中央を口領域として使用
+                            fx1, fy1, fx2, fy2, fconf = face_bbox
+                            face_w = fx2 - fx1
+                            face_h = fy2 - fy1
+                            mouth_cx = (fx1 + fx2) / 2
+                            mouth_cy = fy1 + face_h * 0.75  # 顔の75%位置
+                            mouth_w = face_w * 0.4
+                            mouth_h = mouth_w / args.sprite_aspect
+                            estimated_mouth_bbox = np.array([
+                                mouth_cx - mouth_w / 2,
+                                mouth_cy - mouth_h / 2,
+                                mouth_cx + mouth_w / 2,
+                                mouth_cy + mouth_h / 2,
+                                fconf * 0.5,  # 信頼度を下げる
+                            ], dtype=np.float32)
+                            quad = yolov9_mouth_bbox_to_quad(
+                                estimated_mouth_bbox,
+                                head_angle=head_angle,
+                                pad=args.pad,
+                                sprite_aspect=args.sprite_aspect,
+                            )
+                            conf = float(fconf * 0.5)
+
+            else:
+                # anime-face-detector
+                # 戻り値: [{'bbox': [x1,y1,x2,y2,conf], 'keypoints': (28,3)}, ...]
+                preds = detector(det_frame)
+
+                if det_scale != 1.0 and len(preds) > 0:
+                    scaled_preds = []
+                    for pred in preds:
+                        bbox = np.asarray(pred['bbox'], dtype=np.float32).copy()
+                        if bbox.shape[0] >= 4:
+                            bbox[:4] *= det_inv
+                        keypoints = np.asarray(pred['keypoints'], dtype=np.float32).copy()
+                        if keypoints.shape[1] >= 2:
+                            keypoints[:, :2] *= det_inv
+                        scaled_preds.append({'bbox': bbox, 'keypoints': keypoints})
+                    preds = scaled_preds
+
+                if len(preds) > 0:
+                    # 最も大きい(面積が大きい)顔を選択
+                    best_pred = max(preds, key=lambda p: (p['bbox'][2] - p['bbox'][0]) * (p['bbox'][3] - p['bbox'][1]))
+                    bbox = best_pred['bbox']
+                    keypoints = best_pred['keypoints']
+
+                    # 顔検出の信頼度チェック
+                    if bbox[4] >= args.min_conf:
+                        if args.quad_mode == "bbox":
+                            quad, conf = mouth_quad_from_face_bbox_and_landmarks(
+                                bbox, keypoints,
+                                sprite_aspect=args.sprite_aspect,
+                                pad=args.pad
+                            )
+                        elif args.quad_mode == "mouth":
+                            quad, conf = mouth_quad_from_landmarks(
+                                keypoints, bbox=None, sprite_aspect=args.sprite_aspect, pad=args.pad
+                            )
+                        else:
+                            # hybrid: 口点ベース + 最低サイズfloor
+                            quad, conf = mouth_quad_from_landmarks(
+                                keypoints, bbox=bbox,
+                                sprite_aspect=args.sprite_aspect, pad=args.pad,
+                                min_mouth_w_ratio=args.min_mouth_w_ratio,
+                                min_mouth_w_px=args.min_mouth_w_px
+                            )
 
         if quad is not None and conf >= args.min_conf:
             quads[i] = quad
@@ -907,21 +1102,35 @@ def main() -> int:
         if debug_writer is not None:
             dbg = frame.copy()
 
-            # ランドマーク描画
-            if len(preds) > 0:
+            # 検出結果の描画（検出器タイプに応じて）
+            if args.detector == "yolov9":
+                # YOLOv9: face/mouth BBoxを描画
                 for pred in preds:
-                    draw_landmarks(dbg, pred['keypoints'])
+                    face_bbox = pred.get('face_bbox')
+                    mouth_bbox = pred.get('mouth_bbox')
+                    if face_bbox is not None:
+                        x1, y1, x2, y2 = map(int, face_bbox[:4])
+                        cv2.rectangle(dbg, (x1, y1), (x2, y2), (0, 255, 0), 1)
+                    if mouth_bbox is not None:
+                        x1, y1, x2, y2 = map(int, mouth_bbox[:4])
+                        cv2.rectangle(dbg, (x1, y1), (x2, y2), (255, 0, 255), 2)
+            else:
+                # anime-face-detector: ランドマーク描画
+                for pred in preds:
+                    if 'keypoints' in pred:
+                        draw_landmarks(dbg, pred['keypoints'])
 
             # quad描画
             color = (0, 255, 0) if valid[i] else (0, 0, 255)
             draw_quad(dbg, quads[i], color=color, thickness=2)
 
             # 情報テキスト
+            detector_label = args.detector.upper()
             cv2.putText(
                 dbg,
-                f"frame {i}  valid={int(valid[i])}  conf={confidences[i]:.2f}  faces={len(preds)}  det={int(do_detect)}",
+                f"[{detector_label}] frame {i}  valid={int(valid[i])}  conf={confidences[i]:.2f}  faces={len(preds)}  det={int(do_detect)}",
                 (10, 30),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2, cv2.LINE_AA
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA
             )
 
             debug_writer.write(dbg[:ensure_even(vid_h), :ensure_even(vid_w)])
